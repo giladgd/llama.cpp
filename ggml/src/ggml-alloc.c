@@ -1115,11 +1115,40 @@ size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id) {
 
 // utils
 
-static void free_buffers(ggml_backend_buffer_t ** buffers, const size_t * n_buffers) {
+static void free_buffers(ggml_backend_buffer_t ** buffers, size_t * n_buffers) {
     for (size_t i = 0; i < *n_buffers; i++) {
         ggml_backend_buffer_free((*buffers)[i]);
     }
     free(*buffers);
+    *buffers = NULL;
+    *n_buffers = 0;
+}
+
+static void clear_tensors_using_buffers(struct ggml_context * ctx, ggml_backend_buffer_t * buffers, size_t n_buffers) {
+    if (buffers == NULL || n_buffers == 0) {
+        return;
+    }
+
+    for (struct ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+        if (t->buffer == NULL) {
+            continue;
+        }
+
+        bool in_buffers = false;
+        for (size_t i = 0; i < n_buffers; i++) {
+            if (t->buffer == buffers[i]) {
+                in_buffers = true;
+                break;
+            }
+        }
+
+        if (!in_buffers) {
+            continue;
+        }
+
+        t->buffer = NULL;
+        t->data = NULL;
+    }
 }
 
 static bool alloc_tensor_range(struct ggml_context * ctx,
@@ -1130,11 +1159,15 @@ static bool alloc_tensor_range(struct ggml_context * ctx,
     ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(buft, size);
     if (buffer == NULL) {
         GGML_LOG_ERROR("%s: failed to allocate %s buffer of size %zu\n", __func__, ggml_backend_buft_name(buft), size);
-        free_buffers(buffers, n_buffers);
         return false;
     }
 
-    *buffers = realloc(*buffers, sizeof(ggml_backend_buffer_t) * (*n_buffers + 1));
+    ggml_backend_buffer_t * new_buffers = realloc(*buffers, sizeof(ggml_backend_buffer_t) * (*n_buffers + 1));
+    if (new_buffers == NULL) {
+        ggml_backend_buffer_free(buffer);
+        return false;
+    }
+    *buffers = new_buffers;
     (*buffers)[(*n_buffers)++] = buffer;
 
     struct ggml_tallocr tallocr = ggml_tallocr_new(buffer);
@@ -1155,7 +1188,9 @@ static bool alloc_tensor_range(struct ggml_context * ctx,
         }
         if (status != GGML_STATUS_SUCCESS) {
             GGML_LOG_ERROR("%s: failed to initialize tensor %s\n", __func__, t->name);
-            free_buffers(buffers, n_buffers);
+            clear_tensors_using_buffers(ctx, &buffer, 1);
+            ggml_backend_buffer_free(buffer);
+            (*n_buffers)--;
             return false;
         }
     }
@@ -1169,6 +1204,7 @@ static ggml_backend_buffer_t ggml_backend_alloc_ctx_tensors_from_buft_impl(
 
     size_t alignment = ggml_backend_buft_get_alignment(buft);
     size_t max_size = ggml_backend_buft_get_max_size(buft);
+    const bool has_max_size_cb = buft->iface.get_max_size != NULL;
 
     ggml_backend_buffer_t * buffers = NULL;
     size_t n_buffers = 0;
@@ -1185,6 +1221,8 @@ static ggml_backend_buffer_t ggml_backend_alloc_ctx_tensors_from_buft_impl(
         if (cur_buf_size > 0 && (cur_buf_size + this_size) > max_size) {
             // allocate tensors in the current buffer
             if (!no_alloc && !alloc_tensor_range(ctx, first, t, buft, cur_buf_size, &buffers, &n_buffers)) {
+                clear_tensors_using_buffers(ctx, buffers, n_buffers);
+                free_buffers(&buffers, &n_buffers);
                 return NULL;
             }
             first = t;
@@ -1197,8 +1235,83 @@ static ggml_backend_buffer_t ggml_backend_alloc_ctx_tensors_from_buft_impl(
 
     // allocate remaining tensors
     if (cur_buf_size > 0) {
-        *nbytes_total += cur_buf_size;
-        if (!no_alloc && !alloc_tensor_range(ctx, first, NULL, buft, cur_buf_size, &buffers, &n_buffers)) {
+        if (no_alloc) {
+            *nbytes_total += cur_buf_size;
+        } else if (alloc_tensor_range(ctx, first, NULL, buft, cur_buf_size, &buffers, &n_buffers)) {
+            *nbytes_total += cur_buf_size;
+        } else if (!has_max_size_cb) {
+            size_t max_segment_size = cur_buf_size > alignment ? cur_buf_size - alignment : alignment;
+            max_segment_size = (max_segment_size / alignment) * alignment;
+            if (max_segment_size == 0) {
+                max_segment_size = alignment;
+            }
+
+            for (struct ggml_tensor * cursor = first; cursor != NULL; ) {
+                size_t segment_size = 0;
+                struct ggml_tensor * segment_end = cursor;
+
+                for (struct ggml_tensor * t = cursor; t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+                    size_t this_size = 0;
+                    if (t->data == NULL && t->view_src == NULL) {
+                        this_size = GGML_PAD(ggml_backend_buft_get_alloc_size(buft, t), alignment);
+                    }
+
+                    if (segment_size > 0 && (segment_size + this_size) > max_segment_size) {
+                        break;
+                    }
+
+                    segment_size += this_size;
+                    segment_end = ggml_get_next_tensor(ctx, t);
+                }
+
+                if (segment_end == cursor) {
+                    clear_tensors_using_buffers(ctx, buffers, n_buffers);
+                    free_buffers(&buffers, &n_buffers);
+                    return NULL;
+                }
+
+                if (segment_size == 0) {
+                    cursor = segment_end;
+                    continue;
+                }
+
+                if (alloc_tensor_range(ctx, cursor, segment_end, buft, segment_size, &buffers, &n_buffers)) {
+                    *nbytes_total += segment_size;
+                    cursor = segment_end;
+                    continue;
+                }
+
+                if (segment_size <= alignment) {
+                    clear_tensors_using_buffers(ctx, buffers, n_buffers);
+                    free_buffers(&buffers, &n_buffers);
+                    return NULL;
+                }
+
+                size_t step = (size_t) 1024 * 1024 * 1024; // 1 GiB
+                if (max_segment_size <= step + alignment) {
+                    step = max_segment_size / 2;
+                }
+                if (step < alignment) {
+                    step = alignment;
+                }
+
+                size_t next_max = max_segment_size - step;
+                next_max = (next_max / alignment) * alignment;
+                if (next_max >= max_segment_size && max_segment_size > alignment) {
+                    next_max = max_segment_size - alignment;
+                    next_max = (next_max / alignment) * alignment;
+                }
+                if (next_max == 0) {
+                    clear_tensors_using_buffers(ctx, buffers, n_buffers);
+                    free_buffers(&buffers, &n_buffers);
+                    return NULL;
+                }
+
+                max_segment_size = next_max;
+            }
+        } else {
+            clear_tensors_using_buffers(ctx, buffers, n_buffers);
+            free_buffers(&buffers, &n_buffers);
             return NULL;
         }
     }
